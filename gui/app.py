@@ -3,6 +3,8 @@
 组装所有 GUI 子组件，协调核心业务模块（解析器、报告器、回写器）
 与界面交互，通过 BackgroundWorker 在后台执行耗时任务，
 利用日志队列和 root.after 实现线程安全的 UI 更新。
+支持窗口关闭确认、目录记忆回调、export_config 传递、
+一键完成功能、状态栏信息、拖拽文件支持（通过剪贴板）。
 """
 
 import logging
@@ -22,7 +24,7 @@ from core.models import AnnotationItem, ParseResult, WriteBackConfig
 from utils.logger import setup_logger
 from utils.worker import WorkerTask, BackgroundWorker
 from utils.file_utils import get_output_path
-from config.settings import APP_TITLE, APP_VERSION, DEFAULT_WRITE_BACK_CONFIG
+from config.settings import APP_TITLE, APP_VERSION, APP_GEOMETRY, APP_MIN_SIZE, AppConfig, save_config, load_config
 
 from gui.styles import setup_styles
 from gui.frames.file_select import FileSelectFrame
@@ -37,6 +39,8 @@ class Application(ttk.Frame):
 
     负责组装所有 GUI 子组件，初始化核心业务模块，
     管理数据缓存、日志队列和后台任务执行。
+    支持窗口关闭确认、一键完成、状态栏显示、
+    目录记忆回调连接、export_config 传递。
     """
 
     def __init__(self, root: tk.Tk) -> None:
@@ -58,11 +62,24 @@ class Application(ttk.Frame):
         self._log_queue: queue.Queue = queue.Queue()
         self._logger: logging.Logger = setup_logger(self._log_queue)
 
+        # 一键完成状态
+        self._one_click_phase: int = 0  # 0=未开始, 1=提取中, 2=生成报表中, 3=回写中
+        self._one_click_output_path: str = ""
+
         # 配置全局样式
         setup_styles(root)
 
+        # 配置窗口属性
+        self._setup_window(root)
+
         # 构建 UI
         self._build_ui()
+
+        # 连接目录记忆回调
+        self._connect_dir_callbacks()
+
+        # 连接数据状态联动
+        self._update_data_state()
 
         # 启动日志队列轮询
         self._poll_log_queue()
@@ -78,6 +95,107 @@ class Application(ttk.Frame):
                 "未检测到 ODA File Converter，DWG 文件将无法直接读取。"
                 "支持 DXF 格式文件，或将 DWG 文件另存为 DXF 后使用。"
             )
+
+    # ------------------------------------------------------------------
+    # 窗口配置
+    # ------------------------------------------------------------------
+
+    def _setup_window(self, root: tk.Tk) -> None:
+        """配置窗口属性：标题、大小、最小尺寸、关闭事件处理
+
+        Args:
+            root: Tkinter 根窗口实例
+        """
+        root.title(f"{APP_TITLE} v{APP_VERSION}")
+        root.geometry(APP_GEOMETRY)
+        root.minsize(*APP_MIN_SIZE)
+
+        # 注册窗口关闭事件处理
+        root.protocol("WM_DELETE_WINDOW", self._on_window_close)
+
+        # 注册拖拽文件支持（通过剪贴板粘贴实现）
+        self._setup_clipboard_drop(root)
+
+    def _setup_clipboard_drop(self, root: tk.Tk) -> None:
+        """设置剪贴板监听作为拖拽文件的备选方案
+
+        通过 Ctrl+V 粘贴文件路径到文件选择区域。
+
+        Args:
+            root: Tkinter 根窗口实例
+        """
+        # 绑定 Ctrl+V 到文件添加
+        root.bind("<Control-v>", self._on_paste_files)
+        root.bind("<Control-V>", self._on_paste_files)
+
+    def _on_paste_files(self, event: Optional[tk.Event] = None) -> None:
+        """Ctrl+V 粘贴文件路径到文件选择区域"""
+        try:
+            clipboard_text = self._root.clipboard_get()
+            if not clipboard_text or not clipboard_text.strip():
+                return
+
+            from config.settings import SUPPORTED_EXTENSIONS
+
+            # 按换行分割
+            raw_lines = clipboard_text.strip().splitlines()
+            paths: list[str] = []
+
+            for line in raw_lines:
+                line = line.strip().strip('"').strip("'")
+                if not line:
+                    continue
+                if os.path.isfile(line):
+                    ext = os.path.splitext(line)[1].lower()
+                    if ext in SUPPORTED_EXTENSIONS:
+                        paths.append(line)
+                elif os.path.isdir(line):
+                    for root_dir, _dirs, files in os.walk(line):
+                        for filename in files:
+                            ext = os.path.splitext(filename)[1].lower()
+                            if ext in SUPPORTED_EXTENSIONS:
+                                paths.append(os.path.join(root_dir, filename))
+
+            if paths:
+                self._file_select.add_files(paths)
+                self._logger.info(f"已通过剪贴板添加 {len(paths)} 个文件")
+        except tk.TclError:
+            pass
+
+    def _on_window_close(self) -> None:
+        """窗口关闭事件处理
+
+        如果有正在运行的后台任务，提示用户确认。
+        """
+        if self._worker.is_running():
+            result = messagebox.askyesnocancel(
+                "确认退出",
+                "有后台任务正在执行中。\n\n"
+                "选择「是」强制终止任务并退出。\n"
+                "选择「否」等待任务完成后退出。\n"
+                "选择「取消」返回应用。",
+                parent=self._root,
+            )
+            if result is True:
+                # 强制终止并退出
+                self._worker.stop()
+                self._root.destroy()
+            elif result is False:
+                # 等待任务完成后退出
+                self._logger.info("等待后台任务完成后退出...")
+                self._wait_and_close()
+            # result is None: 取消，不做任何操作
+        else:
+            # 无后台任务，直接退出
+            self._root.destroy()
+
+    def _wait_and_close(self) -> None:
+        """等待后台任务完成后关闭窗口"""
+        if not self._worker.is_running():
+            self._root.destroy()
+        else:
+            # 每 500ms 检查一次
+            self._root.after(500, self._wait_and_close)
 
     # ------------------------------------------------------------------
     # UI 构建
@@ -96,6 +214,8 @@ class Application(ttk.Frame):
             on_generate=self._on_generate,
             on_writeback=self._on_writeback,
             on_open_output=self._on_open_output,
+            on_one_click=self._on_one_click,
+            on_cancel=self._on_cancel,
         )
         self._control_panel.pack(fill=tk.X, padx=5, pady=2)
 
@@ -110,6 +230,96 @@ class Application(ttk.Frame):
         # 日志与进度条
         self._log_panel = LogPanel(self)
         self._log_panel.pack(fill=tk.X, padx=5, pady=(2, 5))
+
+        # 状态栏
+        self._build_status_bar()
+
+    def _build_status_bar(self) -> None:
+        """构建底部状态栏，显示文件数、标注总数等信息"""
+        self._status_bar = ttk.Frame(self, style="StatusBar.TFrame")
+        self._status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+
+        self._status_files_var = tk.StringVar(value="文件: 0")
+        ttk.Label(
+            self._status_bar,
+            textvariable=self._status_files_var,
+            style="StatusBar.TLabel",
+        ).pack(side=tk.LEFT, padx=(10, 5))
+
+        ttk.Label(
+            self._status_bar,
+            text="|",
+            style="StatusBarSeparator.TLabel",
+        ).pack(side=tk.LEFT, padx=2)
+
+        self._status_annotations_var = tk.StringVar(value="标注: 0")
+        ttk.Label(
+            self._status_bar,
+            textvariable=self._status_annotations_var,
+            style="StatusBar.TLabel",
+        ).pack(side=tk.LEFT, padx=(5, 5))
+
+        ttk.Label(
+            self._status_bar,
+            text="|",
+            style="StatusBarSeparator.TLabel",
+        ).pack(side=tk.LEFT, padx=2)
+
+        self._status_selected_var = tk.StringVar(value="选中文件: 0")
+        ttk.Label(
+            self._status_bar,
+            textvariable=self._status_selected_var,
+            style="StatusBar.TLabel",
+        ).pack(side=tk.LEFT, padx=(5, 10))
+
+        # 右侧版本信息
+        ttk.Label(
+            self._status_bar,
+            text=f"v{APP_VERSION}",
+            style="StatusBar.TLabel",
+        ).pack(side=tk.RIGHT, padx=(5, 10))
+
+    # ------------------------------------------------------------------
+    # 目录记忆回调连接
+    # ------------------------------------------------------------------
+
+    def _connect_dir_callbacks(self) -> None:
+        """连接 file_select 的目录记忆回调到 AppConfig"""
+        config = load_config()
+
+        def get_last_dir() -> str:
+            cfg = load_config()
+            return cfg.last_file_dir
+
+        def set_last_dir(directory: str) -> None:
+            cfg = load_config()
+            cfg.last_file_dir = directory
+            save_config(cfg)
+
+        self._file_select.set_dir_callbacks(get_last_dir, set_last_dir)
+
+    # ------------------------------------------------------------------
+    # 数据状态联动
+    # ------------------------------------------------------------------
+
+    def _update_data_state(self) -> None:
+        """更新数据相关的 UI 状态（按钮可用性、状态栏）"""
+        has_data = len(self._all_items) > 0
+
+        # 联动控制面板按钮状态
+        self._control_panel.set_data_state(has_data)
+
+        # 更新状态栏
+        self._update_status_bar()
+
+    def _update_status_bar(self) -> None:
+        """更新状态栏显示信息"""
+        file_count = self._file_select.get_file_count()
+        annotation_count = len(self._all_items)
+
+        self._status_files_var.set(f"文件: {file_count}")
+        self._status_annotations_var.set(f"标注: {annotation_count}")
+        self._status_selected_var.set(f"选中文件: {file_count}")
 
     # ------------------------------------------------------------------
     # 日志队列轮询
@@ -205,10 +415,15 @@ class Application(ttk.Frame):
         if error:
             self._logger.error(f"标注提取失败: {error}")
             messagebox.showerror("错误", f"标注提取失败:\n{error}")
+            # 一键完成模式下，终止流程
+            if self._one_click_phase > 0:
+                self._one_click_phase = 0
             return
 
         if results is None:
             self._logger.error("标注提取返回空结果")
+            if self._one_click_phase > 0:
+                self._one_click_phase = 0
             return
 
         # 缓存解析结果
@@ -239,6 +454,14 @@ class Application(ttk.Frame):
             f", 共 {total_count} 条标注"
         )
 
+        # 更新数据状态联动
+        self._update_data_state()
+
+        # 一键完成模式：继续下一步（生成报表）
+        if self._one_click_phase == 1:
+            self._one_click_phase = 2
+            self._root.after(500, self._one_click_step_generate)
+
     # ------------------------------------------------------------------
     # 事件处理：生成报表
     # ------------------------------------------------------------------
@@ -268,10 +491,25 @@ class Application(ttk.Frame):
         )
 
         if not output_path:
+            # 一键完成模式下，跳过报表
+            if self._one_click_phase == 2:
+                self._one_click_phase = 3
+                self._root.after(300, self._one_click_step_writeback)
             return
 
+        self._generate_report_to(output_path)
+
+    def _generate_report_to(self, output_path: str) -> None:
+        """生成报表到指定路径
+
+        Args:
+            output_path: 输出文件路径
+        """
         self._set_busy(True)
         self._logger.info(f"开始生成报表: {output_path}")
+
+        # 获取导出配置
+        export_config = self._settings_panel.get_export_config()
 
         # 进度回调
         def on_progress(current: int, total: int) -> None:
@@ -290,7 +528,10 @@ class Application(ttk.Frame):
         task = WorkerTask(
             func=self._reporter.generate_report,
             args=(self._parse_results, output_path),
-            kwargs={"progress_callback": on_progress},
+            kwargs={
+                "progress_callback": on_progress,
+                "export_config": export_config,
+            },
             on_complete=on_complete,
         )
         self._worker.run(task)
@@ -303,13 +544,25 @@ class Application(ttk.Frame):
 
         if error:
             self._logger.error(f"报表生成失败: {error}")
-            messagebox.showerror("错误", f"报表生成失败:\n{error}")
+            if self._one_click_phase > 0:
+                # 一键完成模式下跳过报表失败，继续回写
+                self._one_click_phase = 3
+                self._root.after(300, self._one_click_step_writeback)
+            else:
+                messagebox.showerror("错误", f"报表生成失败:\n{error}")
             return
 
         if result:
             self._log_panel.set_progress(1, 1, "报表生成完成")
             self._logger.info(f"报表已生成: {result}")
-            messagebox.showinfo("成功", f"报表已生成:\n{result}")
+
+            if self._one_click_phase == 0:
+                messagebox.showinfo("成功", f"报表已生成:\n{result}")
+
+        # 一键完成模式：继续下一步（序号回写）
+        if self._one_click_phase == 2:
+            self._one_click_phase = 3
+            self._root.after(300, self._one_click_step_writeback)
 
     # ------------------------------------------------------------------
     # 事件处理：序号回写
@@ -428,6 +681,19 @@ class Application(ttk.Frame):
             f"{f', 失败 {fail_count} 个' if fail_count > 0 else ''}"
         )
 
+        # 一键完成模式下，显示汇总信息
+        if self._one_click_phase == 3:
+            self._one_click_phase = 0
+            msg = "一键完成操作已全部执行完毕。\n\n"
+            msg += f"标注提取: {len(self._all_items)} 条\n"
+            if self._one_click_output_path:
+                msg += f"报表生成: {self._one_click_output_path}\n"
+            msg += f"序号回写: 成功 {success_count}/{total} 个文件"
+            if fail_count > 0:
+                msg += f"\n失败 {fail_count} 个文件"
+            messagebox.showinfo("一键完成", msg)
+            return
+
         msg = f"序号回写完成\n成功: {success_count} 个文件"
         if fail_count > 0:
             msg += f"\n失败: {fail_count} 个文件"
@@ -435,6 +701,96 @@ class Application(ttk.Frame):
                 msg += f"\n  - {err}"
 
         messagebox.showinfo("回写结果", msg)
+
+    # ------------------------------------------------------------------
+    # 一键完成功能
+    # ------------------------------------------------------------------
+
+    def _on_one_click(self) -> None:
+        """一键完成按钮点击事件处理
+
+        依次执行：提取标注 -> 生成报表 -> 序号回写
+        """
+        files = self._file_select.get_selected_files()
+        if not files:
+            messagebox.showwarning("提示", "请先选择要处理的 DWG/DXF 文件。")
+            return
+
+        # 确认执行
+        if not messagebox.askyesno(
+            "一键完成",
+            f"将对 {len(files)} 个文件依次执行：\n"
+            "  1. 提取标注\n"
+            "  2. 生成 Excel 报表\n"
+            "  3. 序号回写\n\n"
+            "是否继续？",
+            parent=self._root,
+        ):
+            return
+
+        self._one_click_phase = 1  # 进入提取阶段
+        self._one_click_output_path = ""
+
+        # 弹出保存对话框选择报表输出路径
+        output_path = filedialog.asksaveasfilename(
+            parent=self._root,
+            title="一键完成 - 选择报表保存路径",
+            defaultextension=".xlsx",
+            filetypes=[
+                ("Excel 文件", "*.xlsx"),
+                ("所有文件", "*.*"),
+            ],
+            initialfile="标注提取报表.xlsx",
+        )
+        if output_path:
+            self._one_click_output_path = output_path
+        else:
+            # 用户取消选择路径，仍然执行提取和回写，跳过报表
+            self._one_click_output_path = ""
+
+        # 开始第一步：提取标注
+        self._on_extract()
+
+    def _one_click_step_generate(self) -> None:
+        """一键完成第二步：生成报表"""
+        if self._one_click_phase != 2:
+            return
+
+        if self._one_click_output_path:
+            self._generate_report_to(self._one_click_output_path)
+        else:
+            # 跳过报表，直接回写
+            self._one_click_phase = 3
+            self._root.after(300, self._one_click_step_writeback)
+
+    def _one_click_step_writeback(self) -> None:
+        """一键完成第三步：序号回写"""
+        if self._one_click_phase != 3:
+            return
+
+        if not self._all_items:
+            self._logger.warning("一键完成：没有可回写的数据，跳过回写步骤。")
+            self._one_click_phase = 0
+            messagebox.showinfo("一键完成", "操作完成（无可回写数据）。")
+            return
+
+        self._on_writeback()
+
+    # ------------------------------------------------------------------
+    # 取消操作
+    # ------------------------------------------------------------------
+
+    def _on_cancel(self) -> None:
+        """取消操作按钮点击事件处理"""
+        if self._worker.is_running():
+            if messagebox.askyesno(
+                "确认取消", "确定要取消当前正在执行的任务吗？", parent=self._root
+            ):
+                self._worker.stop()
+                self._set_busy(False)
+                self._one_click_phase = 0
+                self._logger.warning("用户取消了当前操作")
+                self._log_panel.set_progress(0, 0, "已取消")
 
     # ------------------------------------------------------------------
     # 事件处理：打开输出目录
@@ -499,6 +855,7 @@ class Application(ttk.Frame):
         """设置应用忙碌状态
 
         禁用/启用操作按钮，设置鼠标样式。
+        同时更新状态栏信息。
 
         Args:
             busy: True 为忙碌（禁用按钮，等待光标），False 为空闲
@@ -509,3 +866,6 @@ class Application(ttk.Frame):
             self._root.configure(cursor="watch")
         else:
             self._root.configure(cursor="")
+
+        # 更新状态栏
+        self._update_status_bar()
