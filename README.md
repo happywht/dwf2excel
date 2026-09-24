@@ -40,4 +40,4 @@ python main.py
 
 ## Development status
 
-The repository is maintained as an open-source engineering utility. Format coverage, edge cases, and safe write-back behavior should be validated against representative drawings before production use. Please open an issue with a minimal, sanitized example when you find a problem.
+The repository is maintained as a public engineering utility. Format coverage, edge cases, and safe write-back behavior should be validated against representative drawings before production use. Please open an issue with a minimal, sanitized example when you find a problem.
